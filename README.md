@@ -1,105 +1,99 @@
-> [!IMPORTANT]
-> All rights to the assets belong to their respective authors.
+# GABGL
 
-<div align="center">
-  
-## Game preview
+A C++20 game engine with OpenGL, DirectX 12 and Vulkan backends. GABGL owns the
+rendering pipeline, shadows, bloom, PS1 effects, particles, editor, scene loading
+and persistence, model/animation management, audio, fonts, physics, window and input.
+[GAB_THE_GAME](https://github.com/Gabrax/GAB_THE_GAME) is a separate application
+that supplies gameplay, concrete scenes and its own assets.
 
-</div>
+Public headers live in `include/gabgl`; implementations live in `src/Engine`,
+`src/Runtime`, `src/Platform` and `src/Input`. All public names use `GAB::`.
+The complete engine is exposed by one CMake target, `GAB::engine`.
 
-<div align="center">
-
-https://github.com/user-attachments/assets/dfeda195-f8d6-4073-aff7-d7bfe55fce39
-
-</div>
-
-<div align="center">
-  
-## Dependencies
-
-</div>
-
-<div align="center">
-
-<p>
-<a href="https://github.com/glfw/glfw">glfw</a> •
-<a href="https://github.com/Dav1dde/glad">glad</a> •
-<a href="https://github.com/g-truc/glm">glm</a> •
-<a href="https://github.com/ocornut/imgui">imgui</a> •
-<a href="https://github.com/CedricGuillemet/ImGuizmo">ImGuizmo</a> •
-<a href="https://github.com/libsndfile/libsndfile">libsndfile</a> •
-<a href="https://github.com/kcat/openal-soft">OpenAL-Soft</a> •
-<a href="https://github.com/nothings/stb/blob/master/stb_image.h">stb_image</a> •
-<a href="https://github.com/freetype/freetype">freetype</a> •
-<a href="https://github.com/assimp/assimp">assimp</a> •
-<a href="https://github.com/zeux/meshoptimizer">meshoptimizer</a> •
-<a href="https://github.com/shader-slang/slang">Slang</a> •
-<a href="https://github.com/nlohmann/json">nlohmann_json</a> •
-<a href="https://github.com/syoyo/tinyexr">tinyEXR</a> •
-<a href="https://github.com/NVIDIA-Omniverse/PhysX">PhysX</a>
-• <a href="https://github.com/Gabrax/GABDEBUG">GABDEBUG</a>
-</p>
-
-</div>
-
-On Windows, the optional DirectX 12
-path can be enabled at configure time and selected without changing the saved
-configuration:
+On Windows x64, use a Visual Studio Developer PowerShell with CMake and Ninja.
+Install a Vulkan SDK containing Slang, or set `SLANG_ROOT` to a standalone Slang
+SDK. The bundled PhysX libraries target Windows x64. OpenGL is always compiled;
+`GABGL_ENABLE_DX12` defaults to on on Windows and `GABGL_ENABLE_VULKAN` defaults
+to on when its SDK is available. These options belong to the engine.
 
 ```powershell
-cmake -S . -B build -DGABGL_ENABLE_DX12=ON
-cmake --build build --config Release
-build\gl_engine.exe --renderer=dx12
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-Alternatively, set `graphics.api` in `gab.ini` to `"dx12"`. Use
-`--renderer=opengl` to override that setting for a single run.
+Applications consume the engine with FetchContent:
 
-The Vulkan backend can be built and selected in the same way:
+```cmake
+include(FetchContent)
+FetchContent_Declare(gabgl
+  GIT_REPOSITORY https://github.com/Gabrax/GABGL.git
+  GIT_TAG main # Pin a published engine revision for release builds.
+)
+FetchContent_MakeAvailable(gabgl)
+add_executable(my_game main.cpp)
+target_link_libraries(my_game PRIVATE GAB::engine)
+gabgl_deploy_runtime(my_game)
+```
+
+Examples and engine tests default to off when embedded. For unpublished engine
+changes, configure the application with
+`-DFETCHCONTENT_SOURCE_DIR_GABGL=C:/path/to/GABGL`. CMake fetches the engine's
+external dependencies and provides its vendored dependencies transitively.
+`gabgl_deploy_runtime` copies the required Slang runtime beside an executable.
+
+A minimal 2D OpenGL application uses the window/frame API:
+
+```cpp
+#include <gabgl/gabgl.h>
+
+int main()
+{
+    if (!GAB::INIT()) return 1;
+    while (!GAB::WindowShouldClose())
+    {
+        if (!GAB::BeginDrawing()) continue;
+        GAB::ClearBackground({0.04f, 0.06f, 0.1f, 1.0f});
+        GAB::DrawRectangle(100, 100, 80, 80, {0.2f, 0.7f, 1.0f, 1.0f});
+        GAB::EndDrawing();
+    }
+    GAB::TERMINATE();
+}
+```
+
+`gabgl_basic_window` is a complete example. The full scene pipeline selects an
+engine backend through `GAB::RenderBackend::Select(api)` and passes
+`&GAB::RenderBackend::Get()` as `GAB::InitConfig::Device`. The application composes
+its service startup and teardown, as shown by the game's `GameBootstrap.cpp`.
+The built-in scene renderers for all three APIs are compiled in the engine.
+Applications may also provide another implementation of `GAB::GraphicsDevice`.
+
+Engine shaders live in `res/shaders`; the engine resolves them independently of
+application assets and the working directory. A packaged application can override
+their location with `GAB::Resources::SetShaderRoot`. The application configures
+its own assets before loading scenes:
+
+```cpp
+GAB::Resources::SetAssetRoot("C:/path/to/my-game/res");
+GAB::SceneManager::SetSceneFile("scenes/scene.json");
+// After RenderSystem::Initialize(), load application fonts explicitly:
+GAB::FontManager::LoadFont(GAB::Resources::AssetPath("fonts/ui.ttf").c_str());
+```
+
+The first loaded font becomes the default used by loading/debug/editor UI;
+`SetDefaultFont` can choose another loaded font. The camera follows the scene
+entity marked `player`, without assuming a particular game's model name.
+Scene factories and gameplay interaction callbacks are supplied by the application.
+Relative scene assets, legacy `../res/` paths and absolute imported paths work.
+
+CTest runs resource-boundary checks and the D3D12 WARP shader regression when
+DX12 is enabled. Asset-free desktop integration targets are opt-in:
 
 ```powershell
-cmake -S . -B build -DGABGL_ENABLE_VULKAN=ON
-cmake --build build --config Release
-build\gl_engine.exe --renderer=vulkan
+cmake --build build --target engine_smoke vulkan_bootstrap_smoke
+.\build\engine_smoke.exe
+.\build\vulkan_bootstrap_smoke.exe
 ```
 
-The Vulkan backend owns the instance, physical/logical device, presentation queues,
-resize-safe swapchain, frame synchronization, VSync present-mode changes and Dear
-ImGui renderer. Its SPIR-V scene path includes skinned diffuse/normal/specular
-materials, a three-target G-buffer, deferred directional/point/spot lighting,
-GPU-culled directional and cached cubemap point shadows, native skyboxes, a depth
-prepass with same-frame Hi-Z occlusion and indirect draws, tiled light lists, alpha-blended particles, debug and
-physics lines, editor render targets, model previews, and HDR post-processing with
-a bloom pyramid, gamma and PS1 color/geometry modes. Set
-`GABGL_VULKAN_VALIDATION=1` to request Khronos validation when the layer is installed.
-The focused presentation smoke test is available as the
-`vulkan_bootstrap_smoke` build target.
-
-All renderers are selected through the same backend contract. Models, particles,
-screen UI, ImGui, debug layers, culling statistics and visual-effect settings are
-submitted without backend-specific branches in scene code, leaving future APIs a
-single interface to implement.
-
-An opt-in desktop integration test exercises the real scene, DX12/Vulkan effect quality
-changes, PS1 on/off, particles, editor render targets and odd-size resizing. It also
-supports an OpenGL regression run. Build with `BUILD_TESTING=ON` and the desired
-native backends enabled, then run from the repository root:
-
-```powershell
-cmake --build cmake-build-release --target renderer_smoke
-./tests/RunRendererSmoke.ps1
-```
-
-Pass `-BuildDirectory` for another build directory. The script checks process exit
-codes and renderer error logs. `GABGL_DX12_VALIDATION=1` and
-`GABGL_VULKAN_VALIDATION=1` enable their respective validation layers. These integration tests require a
-desktop and scene assets and are intentionally excluded from automatic CTest runs.
-
-The `dx12_instances` CTest regression runs headlessly on D3D12 WARP. It reads back
-positions from the actual scene and shadow vertex shaders through `ExecuteIndirect`,
-covering nonzero instance offsets, translation, rotation, nonuniform scale and skinning.
-DX12 transform buffers store explicit GLM columns; each draw passes its compacted
-instance base in the constant buffer because `SV_InstanceID` starts at zero.
-The same test checks all six point-shadow face projections against cubemap UV
-coordinates. DX12 uses explicit left-handed views and a [0,1] depth projection
-for those faces so rendering and `TextureCube` sampling have the same orientation.
+The Vulkan target requires `GABGL_ENABLE_VULKAN=ON`. Complete scene-rendering
+integration tests using the game's assets belong to GAB_THE_GAME.

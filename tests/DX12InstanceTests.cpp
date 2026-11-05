@@ -1,3 +1,4 @@
+#include <gabgl/Resources.h>
 // Headless WARP regression: execute the real scene/shadow vertex shaders and
 // read back world/clip positions. Visibility counts cannot detect wrong models.
 #define NOMINMAX
@@ -6,8 +7,8 @@
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
-#include "Shader.h"
-#include "DirectX12ShadowMath.h"
+#include <gabgl/Shader.h>
+#include <gabgl/DirectX12ShadowMath.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <array>
 #include <cmath>
@@ -57,7 +58,7 @@ struct TestVertex
 
 static void Run(ID3D12Device* device, const char* entry, bool animated)
 {
-  const auto shader = Shader::CompileSlang("res/shaders/scene.slang", entry, "vs_5_1");
+  const auto shader = GAB::Shader::CompileSlang(GAB::Resources::ShaderPath("scene.slang"), entry, "vs_5_1");
   ComPtr<ID3D12ShaderReflection> reflection;
   Check(D3DReflect(shader.GetBufferPointer(), shader.GetBufferSize(), IID_PPV_ARGS(&reflection)));
   auto* cb = reflection->GetConstantBufferByName("SceneConstants");
@@ -250,7 +251,7 @@ static void CheckPointShadowOrientation()
           glm::vec3(s, -t, 1), glm::vec3(-s, -t, -1)};
         for (uint32_t face = 0; face < rays.size(); ++face)
         {
-          const auto matrix = DX12Shadow::PointViewProjection(light, face, 0.1f, 20.0f);
+          const auto matrix = GAB::DX12Shadow::PointViewProjection(light, face, 0.1f, 20.0f);
           const auto clip = matrix * glm::vec4(light + 5.0f * rays[face], 1);
           const glm::vec3 ndc = glm::vec3(clip) / clip.w;
           const glm::vec2 uv(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);

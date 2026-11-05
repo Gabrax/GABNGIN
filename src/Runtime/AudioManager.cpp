@@ -1,0 +1,843 @@
+#include <gabgl/AudioManager.h>
+
+#include <stdio.h>
+#include <vector>
+#include <sndfile.h>
+#include <inttypes.h>
+#include <AL\alext.h>
+#include <memory>
+#include <iostream>
+#include <unordered_map>
+#include <filesystem>
+#include <mutex>
+#include <gabdebug.h>
+#include "al.h"
+#include <algorithm>
+#include <ranges>
+
+namespace GAB
+{
+static void ALC_CheckAndThrow(ALCdevice* device)
+{
+	if (ALCenum err = alcGetError(device); err != ALC_NO_ERROR)
+	{
+	  const char* msg = alcGetString(device, err);
+	  throw std::runtime_error(std::string("ALC error: ") + (msg ? msg : "Unknown ALC error"));
+	}
+}
+
+static void AL_CheckAndThrow()
+{
+	if (ALenum err = alGetError(); err != AL_NO_ERROR)
+	{
+	  const char* msg = alGetString(err);
+	  throw std::runtime_error(std::string("AL error: ") + (msg ? msg : "Unknown AL error"));
+	}
+}
+
+struct MusicSource
+{
+	explicit MusicSource(const char* filename);
+	~MusicSource();
+	void Play(const float& volume);
+	void Play(const glm::vec3& position, const float& volume);
+	void Pause() const;
+	void Stop();
+	void Resume();
+	void SetLoop(bool loop);
+	bool isPlaying() const;
+
+	void UpdateBufferStream();
+	ALint getSource() const;
+	void SetVolume(const float& val) const;
+
+private:
+	void ClearQueuedBuffers();
+
+	bool loop = false;
+	bool playbackRequested = false;
+	ALuint p_Source = 0;
+	static const int BUFFER_SAMPLES = 8192;
+	static const int NUM_BUFFERS = 4;
+	ALuint p_Buffers[NUM_BUFFERS]{};
+	SNDFILE* p_SndFile = nullptr;
+	SF_INFO p_Sfinfo{};
+	short* p_Membuf = nullptr;
+	ALenum p_Format = AL_NONE;
+};
+
+struct AudioSystemData
+{
+	ALCdevice* p_ALCDevice;
+	ALCcontext* p_ALCContext;
+
+	std::unordered_map<std::string, ALuint> p_SoundEffectBuffers;
+	std::vector<ALuint> m_Sources;
+	ALuint m_LastUsedBuffer = 0;
+
+	std::unordered_map<std::string, std::unique_ptr<MusicSource>> players;
+
+	std::mutex s_AudioMutex;
+	float musicVolume = 0.5f;
+	float sfxVolume = 0.7f;
+
+} s_Data;
+
+void AudioManager::Init()
+{
+	s_Data.p_ALCDevice = alcOpenDevice(nullptr); // nullptr = get default device
+	if (!s_Data.p_ALCDevice)
+		throw("failed to get sound device");
+
+	s_Data.p_ALCContext = alcCreateContext(s_Data.p_ALCDevice, nullptr);  // create context
+	if (!s_Data.p_ALCContext)
+		throw("Failed to set sound context");
+
+	if (!alcMakeContextCurrent(s_Data.p_ALCContext))   // make context current
+		throw("failed to make context current");
+
+	const ALCchar* name = nullptr;
+	if (alcIsExtensionPresent(s_Data.p_ALCDevice, "ALC_ENUMERATE_ALL_EXT"))
+		name = alcGetString(s_Data.p_ALCDevice, ALC_ALL_DEVICES_SPECIFIER);
+	if (!name || alcGetError(s_Data.p_ALCDevice) != AL_NO_ERROR)
+		name = alcGetString(s_Data.p_ALCDevice, ALC_DEVICE_SPECIFIER);
+	/*printf("Opened \"%s\"\n", name);*/
+  gablog_log(LOG_INFO, __FILE__, __LINE__, "%s", static_cast<const char*>(name));
+
+  constexpr int SOURCE_POOL_SIZE = 16;
+
+	ALCcontext* currentCtx = alcGetCurrentContext();
+	if (!currentCtx)
+		std::cerr << "ERROR: No OpenAL context is active!\n";
+
+	s_Data.m_Sources.resize(SOURCE_POOL_SIZE);
+	alGenSources(SOURCE_POOL_SIZE, s_Data.m_Sources.data());
+	AL_CheckAndThrow();
+
+	s_Data.p_SoundEffectBuffers.clear();
+
+  SetAttunation(AL_LINEAR_DISTANCE_CLAMPED);
+  SetListenerVolume(1.0f);
+}
+
+void AudioManager::Terminate()
+{
+  if (!s_Data.p_ALCContext && !s_Data.p_ALCDevice)
+    return;
+
+  if (s_Data.p_ALCContext)
+    alcMakeContextCurrent(s_Data.p_ALCContext);
+
+  {
+    std::lock_guard lock(s_Data.s_AudioMutex);
+    for (const ALuint source : s_Data.m_Sources)
+    {
+      alSourceStop(source);
+      alSourcei(source, AL_BUFFER, 0);
+    }
+    for (auto &player: s_Data.players | std::views::values)
+      if (player)
+        alSourceStop(static_cast<ALuint>(player->getSource()));
+    s_Data.players.clear();
+  }
+
+  if (!s_Data.m_Sources.empty())
+    alDeleteSources(static_cast<ALsizei>(s_Data.m_Sources.size()), s_Data.m_Sources.data());
+
+  std::vector<ALuint> allBuffers;
+  for (auto &buffer: s_Data.p_SoundEffectBuffers | std::views::values)
+      allBuffers.push_back(buffer);
+  if (!allBuffers.empty())
+    alDeleteBuffers(static_cast<ALsizei>(allBuffers.size()), allBuffers.data());
+
+  s_Data.p_SoundEffectBuffers.clear();
+  s_Data.m_Sources.clear();
+  s_Data.m_LastUsedBuffer = 0;
+
+  alcMakeContextCurrent(nullptr);
+  if (s_Data.p_ALCContext)
+  {
+    alcDestroyContext(s_Data.p_ALCContext);
+    s_Data.p_ALCContext = nullptr;
+  }
+  if (s_Data.p_ALCDevice)
+  {
+    alcCloseDevice(s_Data.p_ALCDevice);
+    s_Data.p_ALCDevice = nullptr;
+  }
+}
+
+void AudioManager::GetListenerLocation(float& x, float& y, float& z)
+{
+	alGetListener3f(AL_POSITION, &x, &y, &z);
+	AL_CheckAndThrow();
+}
+
+void AudioManager::GetListenerOrientation(float& ori)
+{
+	alGetListenerfv(AL_ORIENTATION, &ori);
+	AL_CheckAndThrow();
+}
+
+float AudioManager::GetListenerVolume()
+{
+	float curr_gain;
+	alGetListenerf(AL_GAIN, &curr_gain);
+	AL_CheckAndThrow();
+	return curr_gain;
+}
+
+void AudioManager::SetAttunation(int key)
+{
+	if (key < 0xD001 || key > 0xD006) throw("bad attunation key");
+
+  /*alListeneri(AL_DISTANCE_MODEL, key);*/
+	alDistanceModel(key);
+	AL_CheckAndThrow();
+}
+
+void AudioManager::SetListenerLocation(const glm::vec3& position)
+{
+	alListener3f(AL_POSITION, position.x, position.y, position.z);
+	AL_CheckAndThrow();
+}
+
+void AudioManager::SetListenerOrientation(const glm::vec3& forward, const glm::vec3& up)
+{
+  glm::vec3 f = glm::normalize(forward);
+  glm::vec3 u = glm::normalize(up);
+
+  f = glm::normalize(f - glm::dot(f, u) * u);
+
+  float ori[6] = { f.x, f.y, f.z, u.x, u.y, u.z };
+  alListenerfv(AL_ORIENTATION, ori);
+  AL_CheckAndThrow();
+}
+
+void AudioManager::SetListenerVolume(const float& val)
+{
+	// clamp between 0 and 5
+	float newVol = val;
+	if (newVol < 0.f) newVol = 0.f;
+	else if (newVol > 5.f) newVol = 5.f;
+
+	alListenerf(AL_GAIN, newVol);
+	AL_CheckAndThrow();
+}
+
+void AudioManager::SetMusicVolume(float volume)
+{
+  s_Data.musicVolume = std::clamp(volume, 0.0f, 1.0f);
+  for (auto &player: s_Data.players | std::views::values)
+    player->SetVolume(s_Data.musicVolume);
+}
+
+float AudioManager::GetMusicVolume()
+{
+  return s_Data.musicVolume;
+}
+
+void AudioManager::SetSFXVolume(float volume)
+{
+  s_Data.sfxVolume = std::clamp(volume, 0.0f, 1.0f);
+  for (const ALuint source : s_Data.m_Sources)
+    alSourcef(source, AL_GAIN, s_Data.sfxVolume);
+}
+
+float AudioManager::GetSFXVolume()
+{
+  return s_Data.sfxVolume;
+}
+
+void AudioManager::PlaySound(const std::string& name, const float& volume)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it == s_Data.p_SoundEffectBuffers.end())
+      return;
+
+  ALuint buffer = it->second;
+
+  for (ALuint source : s_Data.m_Sources) {
+      ALint state;
+      alGetSourcei(source, AL_SOURCE_STATE, &state);
+      if (state != AL_PLAYING) {
+          alSourcei(source, AL_BUFFER, buffer);
+          alSourcef(source, AL_GAIN, volume * s_Data.sfxVolume);
+          alSourcePlay(source);
+          AL_CheckAndThrow();
+          s_Data.m_LastUsedBuffer = buffer;
+          return;
+      }
+  }
+
+  std::cerr << "No available source to play sound.\n";
+}
+
+
+void AudioManager::PlaySound(const std::string& name, const glm::vec3& position, const float& volume)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it == s_Data.p_SoundEffectBuffers.end())
+      return;
+
+  ALuint buffer = it->second;
+
+  for (ALuint source : s_Data.m_Sources) {
+      ALint state;
+      alGetSourcei(source, AL_SOURCE_STATE, &state);
+      if (state != AL_PLAYING) {
+          alSourcei(source, AL_BUFFER, buffer);
+          alSourcef(source, AL_GAIN, volume * s_Data.sfxVolume);
+          alSource3f(source, AL_POSITION, position.x, position.y, position.z);
+          alSourcePlay(source);
+          AL_CheckAndThrow();
+          s_Data.m_LastUsedBuffer = buffer;
+          return;
+      }
+  }
+
+  std::cerr << "No available source to play sound.\n";
+}
+
+void AudioManager::StopSound(const std::string& name)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it == s_Data.p_SoundEffectBuffers.end())
+      return;
+
+  ALuint buffer = it->second;
+
+  for (ALuint source : s_Data.m_Sources) {
+      ALint currentBuffer;
+      alGetSourcei(source, AL_BUFFER, &currentBuffer);
+      if (static_cast<ALuint>(currentBuffer) == buffer) {
+          alSourceStop(source);
+      }
+  }
+}
+
+void AudioManager::StopAllSounds()
+{
+	for (ALuint source : s_Data.m_Sources)
+		alSourceStop(source);
+}
+
+void AudioManager::PauseSound(const std::string& name)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it == s_Data.p_SoundEffectBuffers.end())
+      return;  // sound not found
+
+  ALuint buffer = it->second;
+
+  for (ALuint source : s_Data.m_Sources)
+  {
+      ALint currentBuffer;
+      alGetSourcei(source, AL_BUFFER, &currentBuffer);
+      if (static_cast<ALuint>(currentBuffer) == buffer)
+      {
+          alSourcePause(source);
+      }
+  }
+}
+
+void AudioManager::PauseAllSounds()
+{
+	for (ALuint source : s_Data.m_Sources)
+		alSourcePause(source);
+}
+
+void AudioManager::ResumeSound(const std::string& name)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it == s_Data.p_SoundEffectBuffers.end())
+      return;
+
+  ALuint buffer = it->second;
+
+  for (ALuint source : s_Data.m_Sources)
+  {
+      ALint currentBuffer, state;
+      alGetSourcei(source, AL_BUFFER, &currentBuffer);
+      alGetSourcei(source, AL_SOURCE_STATE, &state);
+      if (static_cast<ALuint>(currentBuffer) == buffer && state == AL_PAUSED)
+      {
+          alSourcePlay(source);
+      }
+  }
+}
+
+void AudioManager::ResumeAllSounds()
+{
+	for (ALuint source : s_Data.m_Sources)
+	{
+		ALint state;
+		alGetSourcei(source, AL_SOURCE_STATE, &state);
+		if (state == AL_PAUSED)
+			alSourcePlay(source);
+	}
+}
+
+bool AudioManager::IsSoundPlaying(const std::string& name)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it == s_Data.p_SoundEffectBuffers.end())
+      return false;
+
+  ALuint buffer = it->second;
+
+  for (ALuint source : s_Data.m_Sources)
+  {
+      ALint currentBuffer, state;
+      alGetSourcei(source, AL_BUFFER, &currentBuffer);
+      alGetSourcei(source, AL_SOURCE_STATE, &state);
+      if (static_cast<ALuint>(currentBuffer) == buffer && state == AL_PLAYING)
+      {
+          return true;
+      }
+  }
+  return false;
+}
+
+bool AudioManager::isAnySoundsPlaying()
+{
+	for (ALuint source : s_Data.m_Sources)
+	{
+		ALint state;
+		alGetSourcei(source, AL_SOURCE_STATE, &state);
+		if (state == AL_PLAYING)
+			return true;
+	}
+	return false;
+}
+
+void AudioManager::SetSoundLoop(const std::string& name, bool loop)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it == s_Data.p_SoundEffectBuffers.end())
+      return;
+
+  ALuint buffer = it->second;
+
+  for (ALuint source : s_Data.m_Sources)
+  {
+      ALint currentBuffer;
+      alGetSourcei(source, AL_BUFFER, &currentBuffer);
+      if (static_cast<ALuint>(currentBuffer) == buffer)
+      {
+          alSourcei(source, AL_LOOPING, loop ? AL_TRUE : AL_FALSE);
+          AL_CheckAndThrow();
+      }
+  }
+}
+
+void AudioManager::LoadSound(const char* filename)
+{
+  std::string name = std::filesystem::path(filename).stem().string();
+
+  {
+      std::lock_guard lock(s_Data.s_AudioMutex);
+      if (s_Data.p_SoundEffectBuffers.contains(name)) {
+          return;
+      }
+  }
+
+  ALenum format = AL_NONE;
+  ALuint buffer;
+  SF_INFO sfinfo;
+
+  SNDFILE *sndfile = sf_open(filename, SFM_READ, &sfinfo);
+  if (!sndfile) {
+      std::cerr << "Could not open audio in " << filename << ": " << sf_strerror(sndfile) << "\n";
+      return;
+  }
+
+  if (sfinfo.frames < 1 || sfinfo.frames > (sf_count_t)(INT_MAX / sizeof(short)) / sfinfo.channels) {
+      std::cerr << "Bad sample count in " << filename << " (" << sfinfo.frames << ")\n";
+      sf_close(sndfile);
+      return;
+  }
+
+  if (sfinfo.channels == 1) format = AL_FORMAT_MONO16;
+  else if (sfinfo.channels == 2) format = AL_FORMAT_STEREO16;
+  else if (sfinfo.channels == 3 &&
+           sf_command(sndfile, SFC_WAVEX_GET_AMBISONIC, nullptr, 0) == SF_AMBISONIC_B_FORMAT)
+      format = AL_FORMAT_BFORMAT2D_16;
+  else if (sfinfo.channels == 4 &&
+           sf_command(sndfile, SFC_WAVEX_GET_AMBISONIC, nullptr, 0) == SF_AMBISONIC_B_FORMAT)
+      format = AL_FORMAT_BFORMAT3D_16;
+
+  if (format == AL_NONE) {
+      std::cerr << "Unsupported channel count: " << sfinfo.channels << "\n";
+      sf_close(sndfile);
+      return;
+  }
+
+  short *membuf = static_cast<short *>(malloc(static_cast<size_t>(sfinfo.frames * sfinfo.channels) * sizeof(short)));
+  if (!membuf) {
+      std::cerr << "Failed to allocate memory for audio buffer\n";
+      sf_close(sndfile);
+      return;
+  }
+
+  sf_count_t num_frames = sf_readf_short(sndfile, membuf, sfinfo.frames);
+  if (num_frames < 1) {
+      std::cerr << "Failed to read samples in " << filename << " (" << num_frames << ")\n";
+      free(membuf);
+      sf_close(sndfile);
+      return;
+  }
+
+  ALsizei num_bytes = static_cast<ALsizei>(num_frames * sfinfo.channels * sizeof(short));
+  alGenBuffers(1, &buffer);
+  alBufferData(buffer, format, membuf, num_bytes, sfinfo.samplerate);
+
+  free(membuf);
+  sf_close(sndfile);
+
+  if (ALenum err = alGetError(); err != AL_NO_ERROR) {
+      std::cerr << "OpenAL Error: " << alGetString(err) << "\n";
+      if (buffer && alIsBuffer(buffer))
+          alDeleteBuffers(1, &buffer);
+      return;
+  }
+
+  {
+      std::lock_guard lock(s_Data.s_AudioMutex);
+      s_Data.p_SoundEffectBuffers[name] = buffer;
+  }
+  gablog_log(LOG_WARN, __FILE__, __LINE__, "Sound loaded: %s", name.c_str());
+}
+
+bool AudioManager::UnLoadSound(const std::string& name)
+{
+  auto it = s_Data.p_SoundEffectBuffers.find(name);
+  if (it != s_Data.p_SoundEffectBuffers.end())
+  {
+      for (const ALuint source : s_Data.m_Sources)
+      {
+        ALint currentBuffer = 0;
+        alGetSourcei(source, AL_BUFFER, &currentBuffer);
+        if (static_cast<ALuint>(currentBuffer) == it->second)
+        {
+          alSourceStop(source);
+          alSourcei(source, AL_BUFFER, 0);
+        }
+      }
+      alDeleteBuffers(1, &it->second);
+      s_Data.p_SoundEffectBuffers.erase(it);
+      return true;
+  }
+  return false;
+}
+
+MusicSource::MusicSource(const char* filename)
+{
+	p_SndFile = sf_open(filename, SFM_READ, &p_Sfinfo);
+	if (!p_SndFile)
+	{
+		throw("could not open provided music file -- check path");
+	}
+
+	if (p_Sfinfo.channels == 1) p_Format = AL_FORMAT_MONO16;
+	else if (p_Sfinfo.channels == 2) p_Format = AL_FORMAT_STEREO16;
+	else if (p_Sfinfo.channels == 3)
+	{
+		if (sf_command(p_SndFile, SFC_WAVEX_GET_AMBISONIC, NULL, 0) == SF_AMBISONIC_B_FORMAT)
+			p_Format = AL_FORMAT_BFORMAT2D_16;
+	}
+	else if (p_Sfinfo.channels == 4)
+	{
+		if (sf_command(p_SndFile, SFC_WAVEX_GET_AMBISONIC, NULL, 0) == SF_AMBISONIC_B_FORMAT)
+			p_Format = AL_FORMAT_BFORMAT3D_16;
+	}
+	if (!p_Format)
+	{
+		sf_close(p_SndFile);
+		p_SndFile = NULL;
+		throw("Unsupported channel count from file");
+	}
+
+	std::size_t frame_size = (static_cast<size_t>(BUFFER_SAMPLES) * static_cast<size_t>(p_Sfinfo.channels)) * sizeof(short);
+	p_Membuf = static_cast<short*>(malloc(frame_size));
+  if (!p_Membuf)
+  {
+    sf_close(p_SndFile);
+    p_SndFile = nullptr;
+    throw("could not allocate music streaming buffer");
+  }
+
+	alGenSources(1, &p_Source);
+	alGenBuffers(NUM_BUFFERS, p_Buffers);
+}
+
+MusicSource::~MusicSource()
+{
+	alSourceStop(p_Source);
+	alDeleteSources(1, &p_Source);
+	if (p_SndFile) sf_close(p_SndFile);
+	p_SndFile = nullptr;
+	free(p_Membuf);
+	alDeleteBuffers(NUM_BUFFERS, p_Buffers);
+}
+
+void MusicSource::ClearQueuedBuffers()
+{
+  alSourceStop(p_Source);
+
+  ALint queued = 0;
+  alGetSourcei(p_Source, AL_BUFFERS_QUEUED, &queued);
+  while (queued-- > 0)
+  {
+    ALuint buffer = 0;
+    alSourceUnqueueBuffers(p_Source, 1, &buffer);
+  }
+
+  AL_CheckAndThrow();
+}
+
+void MusicSource::Play(const float& volume)
+{
+  playbackRequested = false;
+  ClearQueuedBuffers();
+  alSourcef(p_Source, AL_GAIN, volume);
+
+  // Rewind file at start of play
+  if (p_SndFile) sf_seek(p_SndFile, 0, SEEK_SET);
+
+  ALsizei i;
+  for (i = 0; i < NUM_BUFFERS; i++)
+  {
+      sf_count_t slen = sf_readf_short(p_SndFile, p_Membuf, BUFFER_SAMPLES);
+      if (slen < 1) break;
+
+      slen *= p_Sfinfo.channels * static_cast<sf_count_t>(sizeof(short));
+      alBufferData(p_Buffers[i], p_Format, p_Membuf, static_cast<ALsizei>(slen), p_Sfinfo.samplerate);
+  }
+  if (alGetError() != AL_NO_ERROR) throw("Error buffering for playback");
+
+  alSourceQueueBuffers(p_Source, i, p_Buffers);
+  alSourcePlay(p_Source);
+  if (alGetError() != AL_NO_ERROR) throw("Error starting playback");
+  playbackRequested = i > 0;
+}
+
+void MusicSource::Play(const glm::vec3& position, const float& volume)
+{
+  ALint i;
+
+  playbackRequested = false;
+  ClearQueuedBuffers();
+  if (p_SndFile) sf_seek(p_SndFile, 0, SEEK_SET);
+
+  alSourcei(p_Source, AL_SOURCE_RELATIVE, AL_FALSE);
+  alSource3f(p_Source, AL_POSITION, position.x, position.y, position.z);
+
+  alSourcef(p_Source, AL_REFERENCE_DISTANCE, 5.0f);
+  alSourcef(p_Source, AL_MAX_DISTANCE, 80.0f);
+  alSourcef(p_Source, AL_ROLLOFF_FACTOR, 1.0f);
+  alSourcef(p_Source, AL_GAIN, volume);
+
+  for (i = 0; i < NUM_BUFFERS; i++)
+  {
+    sf_count_t frames = sf_readf_short(p_SndFile, p_Membuf, BUFFER_SAMPLES);
+    if (frames < 1) break;
+
+    ALenum format;
+    if (p_Sfinfo.channels == 1) format = AL_FORMAT_MONO16;
+    else if (p_Sfinfo.channels == 2) format = AL_FORMAT_STEREO16;
+    else throw("Unsupported channel count");
+
+    alBufferData(
+        p_Buffers[i],
+        format,
+        p_Membuf,
+        static_cast<ALsizei>(frames * sizeof(short) * p_Sfinfo.channels),
+        p_Sfinfo.samplerate
+    );
+  }
+
+  alSourceQueueBuffers(p_Source, i, p_Buffers);
+  alSourcePlay(p_Source);
+
+  if (alGetError() != AL_NO_ERROR) throw("Error starting playback");
+  playbackRequested = i > 0;
+}
+
+void MusicSource::Pause() const
+{
+	if (!playbackRequested) return;
+
+	alSourcePause(p_Source);
+	AL_CheckAndThrow();
+}
+
+void MusicSource::Stop()
+{
+	playbackRequested = false;
+	ClearQueuedBuffers();
+}
+
+void MusicSource::Resume()
+{
+	if (!playbackRequested) return;
+
+	alSourcePlay(p_Source);
+	AL_CheckAndThrow();
+}
+
+void MusicSource::UpdateBufferStream()
+{
+	if (!playbackRequested) return;
+
+  ALint processed, state;
+
+  alGetSourcei(p_Source, AL_SOURCE_STATE, &state);
+  alGetSourcei(p_Source, AL_BUFFERS_PROCESSED, &processed);
+  AL_CheckAndThrow();
+
+  while (processed > 0)
+  {
+      ALuint bufid;
+
+      alSourceUnqueueBuffers(p_Source, 1, &bufid);
+      processed--;
+
+      sf_count_t slen = sf_readf_short(p_SndFile, p_Membuf, BUFFER_SAMPLES);
+      if (slen == 0 && loop)
+      {
+          // Rewind and continue streaming if looping enabled
+          sf_seek(p_SndFile, 0, SEEK_SET);
+          slen = sf_readf_short(p_SndFile, p_Membuf, BUFFER_SAMPLES);
+      }
+
+      if (slen > 0)
+      {
+          slen *= p_Sfinfo.channels * static_cast<sf_count_t>(sizeof(short));
+          alBufferData(bufid, p_Format, p_Membuf, static_cast<ALsizei>(slen), p_Sfinfo.samplerate);
+          alSourceQueueBuffers(p_Source, 1, &bufid);
+      }
+      else
+      {
+          // No data and no loop, just skip re-queuing buffer
+          // Playback will stop once buffers run out
+      }
+
+      if (alGetError() != AL_NO_ERROR)
+          throw("error buffering music data");
+  }
+
+  if (state != AL_PLAYING && state != AL_PAUSED)
+  {
+      ALint queued;
+      alGetSourcei(p_Source, AL_BUFFERS_QUEUED, &queued);
+      AL_CheckAndThrow();
+      if (queued > 0)
+      {
+          alSourcePlay(p_Source);
+          AL_CheckAndThrow();
+      }
+      else
+      {
+          playbackRequested = false;
+      }
+  }
+}
+
+ALint MusicSource::getSource() const
+{
+	return p_Source;
+}
+
+bool MusicSource::isPlaying() const
+{
+	ALint state;
+	alGetSourcei(p_Source, AL_SOURCE_STATE, &state);
+	AL_CheckAndThrow();
+	return (state == AL_PLAYING);
+}
+
+void MusicSource::SetLoop(bool loop)
+{
+  this->loop = loop;
+}
+
+void MusicSource::SetVolume(const float& val) const
+{
+	float newval = val;
+	if (newval < 0) newval = 0;
+	alSourcef(p_Source, AL_GAIN, val);
+	AL_CheckAndThrow();
+}
+
+void AudioManager::LoadMusic(const char* filename)
+{
+  std::string name = std::filesystem::path(filename).stem().string();
+
+  std::lock_guard lock(s_Data.s_AudioMutex);
+  if (auto [it, inserted] = s_Data.players.emplace(name, nullptr); inserted)
+  {
+    it->second = std::make_unique<MusicSource>(filename);
+    gablog_log(LOG_WARN, __FILE__, __LINE__, "Music loaded: %s", name.c_str());
+  }
+}
+
+void AudioManager::PlayMusic(const std::string& name, bool loop, const float& volume)
+{
+  auto it = s_Data.players.find(name);
+  if (it != s_Data.players.end())
+  {
+    it->second->SetLoop(loop);
+    it->second->Play(volume * s_Data.musicVolume);
+  }
+}
+
+void AudioManager::PlayMusic(const std::string& name, const glm::vec3& position, bool loop, const float& volume)
+{
+  auto it = s_Data.players.find(name);
+  if (it != s_Data.players.end())
+  {
+    it->second->SetLoop(loop);
+    it->second->Play(position, volume * s_Data.musicVolume);
+  }
+}
+
+void AudioManager::PauseMusic(const std::string& name)
+{
+  auto it = s_Data.players.find(name);
+  if (it != s_Data.players.end())
+      it->second->Pause();
+}
+
+void AudioManager::StopMusic(const std::string& name)
+{
+  auto it = s_Data.players.find(name);
+  if (it != s_Data.players.end())
+      it->second->Stop();
+}
+
+void AudioManager::StopAllMusic()
+{
+  for (auto& [name, player] : s_Data.players)
+    if (player)
+      player->Stop();
+}
+
+void AudioManager::ResumeMusic(const std::string& name)
+{
+  auto it = s_Data.players.find(name);
+  if (it != s_Data.players.end())
+      it->second->Resume();
+}
+
+void AudioManager::UpdateAllMusic()
+{
+  for (auto &player: s_Data.players | std::views::values)
+      player->UpdateBufferStream();
+}
+
+size_t AudioManager::GetMusicNumTracks()
+{ 
+  return s_Data.players.size();
+}
+} // namespace GAB

@@ -1,8 +1,10 @@
-#include "UserInput.h"
+#include <gabgl/UserInput.h>
 
 #include <GLFW/glfw3.h>
-#include "../backend/Window.h"
+#include <gabgl/Window.h>
 
+namespace GAB
+{
 bool Input::IsKeyPressed(const KeyCode key)
 {
 	auto* window = static_cast<GLFWwindow*>(Window::GetWindowPtr());
@@ -56,3 +58,4 @@ float Input::GetGamepadAxis(int axis)
     return 0.0f;
   return axis >= 0 && axis <= GLFW_GAMEPAD_AXIS_LAST ? state.axes[axis] : 0.0f;
 }
+} // namespace GAB

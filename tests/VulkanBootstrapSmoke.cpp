@@ -1,5 +1,5 @@
-#include "RenderBackend.h"
-#include "Window.h"
+#include <gabgl/RenderBackend.h>
+#include <gabgl/Window.h>
 
 #include <cstdint>
 #include <iostream>
@@ -8,22 +8,22 @@ int main()
 {
   constexpr uint32_t InitialWidth = 640;
   constexpr uint32_t InitialHeight = 360;
-  if (!RenderBackend::Select(GraphicsAPI::Vulkan)) return 1;
-  Window::Init("GABGL Vulkan bootstrap smoke", InitialWidth, InitialHeight, GraphicsAPI::Vulkan);
-  auto& backend = RenderBackend::Get();
+  if (!GAB::RenderBackend::Select(GAB::GraphicsAPI::Vulkan)) return 1;
+  GAB::Window::Init("GABGL Vulkan bootstrap smoke", InitialWidth, InitialHeight, GAB::GraphicsAPI::Vulkan);
+  auto& backend = GAB::RenderBackend::Get();
   if (!backend.InitializeDevice(nullptr, InitialWidth, InitialHeight))
   {
-    Window::Terminate();
+    GAB::Window::Terminate();
     return 2;
   }
 
   bool passed = true;
-  for (uint32_t frame = 0; frame < 24 && Window::IsRunning(); ++frame)
+  for (uint32_t frame = 0; frame < 24 && GAB::Window::IsRunning(); ++frame)
   {
-    Window::PollEvents();
-    if (frame == 8) Window::SetResolution(641, 359);
-    if (frame == 16) Window::SetResolution(InitialWidth, InitialHeight);
-    if (!backend.BeginFrame(Window::GetWidth(), Window::GetHeight()) ||
+    GAB::Window::PollEvents();
+    if (frame == 8) GAB::Window::SetResolution(641, 359);
+    if (frame == 16) GAB::Window::SetResolution(InitialWidth, InitialHeight);
+    if (!backend.BeginFrame(GAB::Window::GetWidth(), GAB::Window::GetHeight()) ||
         !backend.EndFrame(frame >= 12))
     {
       passed = false;
@@ -31,7 +31,7 @@ int main()
     }
   }
   backend.ShutdownDevice();
-  Window::Terminate();
+  GAB::Window::Terminate();
   std::cout << "Vulkan bootstrap smoke " << (passed ? "PASS" : "FAIL") << '\n';
   return passed ? 0 : 3;
 }
